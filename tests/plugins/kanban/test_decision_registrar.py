@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from gateway.decision_receipts import (
     DecisionReceiptService, ReceiptRepository, Scope, RawPrincipal, VerifiedDecision,
+    VerifiedRevocation,
 )
 from plugins.kanban.dashboard.decision_registrar import create_router
 
@@ -81,6 +82,20 @@ class FakeCsrf:
         return self.ok
 
 
+class FakeRevocationVerifier:
+    def verify_revocation(self, reference, receipt_id, expected):
+        from gateway.decision_receipts import RegistrarDeny
+        if reference != "rev-ref-1":
+            raise RegistrarDeny(403, "revocation_verifier_unavailable")
+        return VerifiedRevocation(
+            rev_issuer="https://issuer.example", rev_decision_id="rev-dec-1",
+            target_receipt_id=receipt_id, tenant=TENANT, profile=PROFILE, board=BOARD,
+            card_id=expected.card_id, case_action=expected.case_action,
+            card_revision=expected.card_revision, verbatim_digest="d" * 64,
+            evidence_ref="ev-r", evidence_digest="e" * 64,
+            verified_at=NOW - 10, expires_at=NOW + 3600)
+
+
 def vd():
     return VerifiedDecision(
         decision_issuer="https://issuer.example", decision_id="dec-1", original_actor="owner",
@@ -95,7 +110,8 @@ def build_app(*, csrf=True, enabled=True):
     keys = [(P1.key(), scope().as_tuple())]
     svc = DecisionReceiptService(
         repo, provenance=FakeProvenance(), entitlement=FakeEntitlement(keys),
-        verifier=FakeVerifier({"ref-1": vd()}), cards=FakeCards({scope().as_tuple(): REV}),
+        verifier=FakeVerifier({"ref-1": vd()}), revocation_verifier=FakeRevocationVerifier(),
+        cards=FakeCards({scope().as_tuple(): REV}),
         csrf=FakeCsrf(csrf), clock=FakeClock(), enabled=enabled)
     app = FastAPI()
 
@@ -189,10 +205,26 @@ def test_csrf_failure_route_403():
 def test_revocation_route():
     client, _ = build_app()
     rid = client.post("/decision-registrations", json=body()).json()["receipt_id"]
-    r = client.post(f"/decision-registrations/{rid}/revocations", json=body())
+    r = client.post(f"/decision-registrations/{rid}/revocations", json=body(reference="rev-ref-1"))
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "revoked"
     assert client.get(f"/decision-registrations/{rid}", params=qparams()).json()["status"] == "revoked"
+
+
+def test_disabled_malformed_request_is_404_not_422():
+    # The enabled dependency runs before body/query validation: a disabled registrar must
+    # not leak route existence via a 422 on a malformed request.
+    client, _ = build_app(enabled=False)
+    assert client.post("/decision-registrations", json={}).status_code == 404
+    assert client.get("/decision-registrations/x").status_code == 404
+
+
+def test_read_error_response_no_store():
+    client, _ = build_app()
+    rid = client.post("/decision-registrations", json=body()).json()["receipt_id"]
+    r = client.get(f"/decision-registrations/{rid}", params=qparams(card="other"))
+    assert r.status_code == 404
+    assert r.headers.get("cache-control") == "no-store"
 
 
 if __name__ == "__main__":

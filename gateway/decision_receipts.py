@@ -20,7 +20,6 @@ Trust rules (frozen plan r3, sha256 5fe85109…):
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import threading
@@ -79,6 +78,35 @@ class VerifiedDecision:
     verbatim_digest: str
     evidence_ref: str
     evidence_digest: str
+    # verified_at is the ORIGINAL decision's verification time and MUST be stable across
+    # calls (it is part of the immutable replay binding); a verifier that re-stamps it per
+    # call would turn an identical retry into a binding_conflict. expires_at is the decision's
+    # own expiry, not a registrar-computed window.
+    verified_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class VerifiedRevocation:
+    """Facts a trusted revocation verifier attests for a REVOCATION decision.
+
+    Distinct from ``VerifiedDecision``: a revocation must NAME the receipt it revokes
+    (``target_receipt_id``) and must be a DIFFERENT decision from the approval being
+    revoked. The registrar enforces both; the verifier supplies only verified facts.
+    """
+
+    rev_issuer: str
+    rev_decision_id: str
+    target_receipt_id: str
+    tenant: str
+    profile: str
+    board: str
+    card_id: str
+    case_action: str
+    card_revision: str
+    verbatim_digest: str
+    evidence_ref: str
+    evidence_digest: str
     verified_at: float
     expires_at: float
 
@@ -116,6 +144,13 @@ class DecisionVerifier(Protocol):
     """Resolves an opaque original-decision reference to verified facts. The production
     default always denies; references are opaque ids, never caller-selected URLs."""
     def verify(self, reference: str, expected: Scope) -> VerifiedDecision: ...
+
+
+class RevocationVerifier(Protocol):
+    """Resolves an opaque REVOCATION-decision reference to verified revocation facts that
+    name the target receipt. Production default denies."""
+    def verify_revocation(self, reference: str, receipt_id: str,
+                          expected: Scope) -> VerifiedRevocation: ...
 
 
 class CardResolver(Protocol):
@@ -159,6 +194,12 @@ class DenyVerifier:
         _deny(403, "decision_verifier_unavailable")
 
 
+class DenyRevocationVerifier:
+    def verify_revocation(self, reference: str, receipt_id: str,
+                          expected: Scope) -> VerifiedRevocation:
+        _deny(403, "revocation_verifier_unavailable")
+
+
 class DenyCardResolver:
     def current_revision(self, scope: Scope) -> Optional[str]:
         return None
@@ -197,12 +238,15 @@ class ReceiptRepository:
     """
 
     def __init__(self, path: str):
-        self._path = path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._init_schema()
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._init_schema()
+        except Exception:
+            self._conn.close()  # do not leak the connection if schema init denies
+            raise
 
     def _init_schema(self):
         self._conn.executescript(
@@ -258,7 +302,8 @@ class ReceiptRepository:
             _deny(503, "unsupported_schema")
 
     def close(self):
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def register(self, row: dict) -> tuple:
         """Insert-or-replay inside ONE transaction. Returns (receipt_id, created, binding_match).
@@ -298,17 +343,23 @@ class ReceiptRepository:
                 return None
             return dict(zip(_RECEIPT_FIELDS, r))
 
-    def revoke(self, receipt_id: str, rev: dict) -> bool:
-        """Append-only revocation. Returns True if inserted, False if duplicate (idempotent)."""
+    def revoke(self, receipt_id: str, rev: dict) -> tuple:
+        """Append-only revocation. Returns (inserted, receipt_match).
+
+        UNIQUE(rev_issuer, rev_decision_id) binds one revocation decision to ONE receipt.
+        A duplicate key replays idempotently only when it names the SAME receipt; a different
+        receipt is a binding conflict (receipt_match=False), never a silent no-op success.
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cur = self._conn.execute(
-                    "SELECT 1 FROM revocations WHERE rev_issuer=? AND rev_decision_id=?",
+                    "SELECT receipt_id FROM revocations WHERE rev_issuer=? AND rev_decision_id=?",
                     (rev["rev_issuer"], rev["rev_decision_id"]))
-                if cur.fetchone() is not None:
+                existing = cur.fetchone()
+                if existing is not None:
                     self._conn.execute("COMMIT")
-                    return False
+                    return False, existing[0] == receipt_id
                 self._conn.execute(
                     """INSERT INTO revocations(revocation_row_id,receipt_id,rev_issuer,
                        rev_decision_id,tenant,profile,board,card_id,case_action,card_revision,created_at)
@@ -317,7 +368,7 @@ class ReceiptRepository:
                      rev["tenant"], rev["profile"], rev["board"], rev["card_id"],
                      rev["case_action"], rev["card_revision"], rev["created_at"]))
                 self._conn.execute("COMMIT")
-                return True
+                return True, True
             except Exception:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -334,17 +385,18 @@ class ReceiptRepository:
 class DecisionReceiptService:
     def __init__(self, repo: Optional[ReceiptRepository], *, provenance: ProvenanceAdapter,
                  entitlement: EntitlementService, verifier: DecisionVerifier,
+                 revocation_verifier: RevocationVerifier,
                  cards: CardResolver, csrf: CsrfValidator, clock: Optional[Clock] = None,
-                 enabled: bool = False, validity_seconds: float = 3600.0):
+                 enabled: bool = False):
         self._repo = repo
         self._provenance = provenance
         self._entitlement = entitlement
         self._verifier = verifier
+        self._revocation_verifier = revocation_verifier
         self._cards = cards
         self._csrf = csrf
         self._clock = clock or _SystemClock()
         self._enabled = enabled
-        self._validity = validity_seconds
 
     def _require_enabled(self):
         if not self._enabled:
@@ -355,18 +407,24 @@ class DecisionReceiptService:
             _deny(503, "storage_unavailable")
         return self._repo
 
-    def _admit(self, request_state, scope: Scope) -> RawPrincipal:
-        """Interactive provenance + CSRF + current raw-identity entitlement. Fail closed."""
+    def _prove(self, request_state) -> RawPrincipal:
+        """Prove the interactive principal and reject an incomplete raw identity. Shared by
+        the write admission path and the read path so neither accepts a partial principal."""
         principal = self._provenance.prove(request_state)
         if not (principal.issuer and principal.provider and principal.user_id):
             _deny(403, "incomplete_principal")
+        return principal
+
+    def _admit(self, request_state, scope: Scope) -> RawPrincipal:
+        """Interactive provenance + CSRF + current raw-identity entitlement. Fail closed."""
+        principal = self._prove(request_state)
         if not self._csrf.validate(request_state, principal):
             _deny(403, "csrf_invalid")
         if not self._entitlement.entitled(principal, scope):
             _deny(403, "not_entitled")
         return principal
 
-    def _check_decision_valid(self, vd: VerifiedDecision, now: float):
+    def _check_decision_valid(self, vd: VerifiedDecision | VerifiedRevocation, now: float):
         if vd.verified_at > now or vd.expires_at <= now or vd.expires_at <= vd.verified_at:
             _deny(403, "decision_invalid_time")
 
@@ -381,6 +439,8 @@ class DecisionReceiptService:
         principal = self._admit(request_state, scope)
         vd = self._verifier.verify(reference, scope)
         # decision_issuer comes ONLY from verified evidence (vd), never a caller body field.
+        if not (vd.decision_issuer and vd.decision_id and vd.original_actor):
+            _deny(403, "incomplete_verified_decision")
         if (vd.tenant, vd.profile, vd.board, vd.card_id, vd.case_action, vd.card_revision) != scope.as_tuple():
             _deny(403, "decision_scope_mismatch")
         now = self._clock.now()
@@ -421,23 +481,36 @@ class DecisionReceiptService:
                              stored["card_id"], stored["case_action"], stored["card_revision"])
         if stored_scope.as_tuple() != expected.as_tuple():
             _deny(404, "not_found")
-        vd = self._verifier.verify(reference, expected)
-        if (vd.tenant, vd.profile, vd.board, vd.card_id, vd.case_action, vd.card_revision) != expected.as_tuple():
+        # A revocation is a DISTINCT verified decision that NAMES this receipt. It is never
+        # the approval being revoked, and any scope-entitled principal cannot revoke an
+        # arbitrary receipt with an arbitrary verified decision.
+        vr = self._revocation_verifier.verify_revocation(reference, receipt_id, expected)
+        if not (vr.rev_issuer and vr.rev_decision_id):
+            _deny(403, "incomplete_verified_revocation")
+        if (vr.tenant, vr.profile, vr.board, vr.card_id, vr.case_action, vr.card_revision) != expected.as_tuple():
             _deny(403, "decision_scope_mismatch")
+        if vr.target_receipt_id != receipt_id:
+            _deny(403, "revocation_target_mismatch")
+        if (vr.rev_issuer, vr.rev_decision_id) == (stored["decision_issuer"], stored["decision_id"]):
+            _deny(403, "revocation_is_approval")
         now = self._clock.now()
-        self._check_decision_valid(vd, now)
-        rev = {"rev_issuer": vd.decision_issuer, "rev_decision_id": vd.decision_id,
+        self._check_decision_valid(vr, now)
+        rev = {"rev_issuer": vr.rev_issuer, "rev_decision_id": vr.rev_decision_id,
                "tenant": expected.tenant, "profile": expected.profile, "board": expected.board,
                "card_id": expected.card_id, "case_action": expected.case_action,
                "card_revision": expected.card_revision, "created_at": now}
-        inserted = repo.revoke(receipt_id, rev)
-        return {"receipt_id": receipt_id, "revoked": True, "new_revocation": inserted,
+        inserted, receipt_match = repo.revoke(receipt_id, rev)
+        if not receipt_match:
+            _deny(409, "revocation_binding_conflict")
+        # 'revoked' is derived from stored state, never hard-coded.
+        return {"receipt_id": receipt_id, "revoked": repo.is_revoked(receipt_id),
+                "new_revocation": inserted,
                 "status": self._current_status(receipt_id, expected, principal)}
 
     def read(self, request_state, *, receipt_id: str, expected: Scope) -> dict:
         """Scoped read for a separately authorized reader. Uniform 404 on any mismatch."""
         self._require_enabled()
-        reader_principal = self._provenance.prove(request_state)
+        reader_principal = self._prove(request_state)
         if not self._entitlement.entitled(reader_principal, expected):
             _deny(404, "not_found")
         repo = self._repo_or_deny()
@@ -483,4 +556,5 @@ def disabled_service() -> DecisionReceiptService:
     """
     return DecisionReceiptService(
         repo=None, provenance=DenyProvenance(), entitlement=DenyEntitlement(),
-        verifier=DenyVerifier(), cards=DenyCardResolver(), csrf=DenyCsrf(), enabled=False)
+        verifier=DenyVerifier(), revocation_verifier=DenyRevocationVerifier(),
+        cards=DenyCardResolver(), csrf=DenyCsrf(), enabled=False)

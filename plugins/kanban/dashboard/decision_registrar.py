@@ -17,7 +17,7 @@ separately-approved release prerequisites (trusted adapters + protected storage/
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from gateway.decision_receipts import (
@@ -52,31 +52,41 @@ def create_router(service: DecisionReceiptService | None = None) -> APIRouter:
     service = service if service is not None else disabled_service()
     router = APIRouter()
 
-    def _guard(fn):
+    def _enabled():
+        # Runs as a dependency BEFORE FastAPI validates the body/query, so a disabled
+        # registrar returns a uniform 404 even for a malformed request (no 422 existence leak).
         try:
-            return fn()
+            service._require_enabled()
         except RegistrarDeny as exc:
             raise HTTPException(status_code=exc.status, detail=exc.code)
 
-    @router.post("/decision-registrations")
+    def _guard(fn, headers=None):
+        try:
+            return fn()
+        except RegistrarDeny as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.code, headers=headers)
+
+    @router.post("/decision-registrations", dependencies=[Depends(_enabled)])
     def register(body: RegisterBody, request: Request):
         scope = _scope(body)
         return _guard(lambda: service.register(request.state, reference=body.reference, scope=scope))
 
-    @router.post("/decision-registrations/{receipt_id}/revocations")
+    @router.post("/decision-registrations/{receipt_id}/revocations", dependencies=[Depends(_enabled)])
     def revoke(receipt_id: str, body: RevokeBody, request: Request):
         scope = _scope(body)
         return _guard(lambda: service.revoke(request.state, receipt_id=receipt_id,
                                              reference=body.reference, expected=scope))
 
-    @router.get("/decision-registrations/{receipt_id}")
+    @router.get("/decision-registrations/{receipt_id}", dependencies=[Depends(_enabled)])
     def read(receipt_id: str, request: Request, response: Response,
              tenant: str, profile: str, board: str, card_id: str,
              case_action: str, card_revision: str):
         # Query params carry only the expected scope; the reader principal is proven and
-        # entitlement-checked server-side. Mismatch/missing returns a uniform 404.
+        # entitlement-checked server-side. Mismatch/missing returns a uniform 404. no-store
+        # applies to error responses too (no caching of denial/exists signals).
         scope = Scope(tenant, profile, board, card_id, case_action, card_revision)
-        result = _guard(lambda: service.read(request.state, receipt_id=receipt_id, expected=scope))
+        result = _guard(lambda: service.read(request.state, receipt_id=receipt_id, expected=scope),
+                        headers={"Cache-Control": "no-store"})
         response.headers["Cache-Control"] = "no-store"
         return result
 

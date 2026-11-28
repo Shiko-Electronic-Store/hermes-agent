@@ -29,7 +29,8 @@ def raises(exc):
 
 from gateway.decision_receipts import (
     DecisionReceiptService, ReceiptRepository, RegistrarDeny, Scope, RawPrincipal,
-    VerifiedDecision, DenyProvenance, DenyEntitlement, DenyVerifier, DenyCardResolver, DenyCsrf,
+    VerifiedDecision, VerifiedRevocation, DenyProvenance, DenyEntitlement, DenyVerifier,
+    DenyRevocationVerifier, DenyCardResolver, DenyCsrf,
 )
 
 TENANT, PROFILE, BOARD, CARD = "t1", "p1", "default", "card-1"
@@ -78,6 +79,27 @@ class FakeVerifier:
         return vd
 
 
+class FakeRevocationVerifier:
+    """reference -> {rev_decision_id, rev_issuer?, target}. target=='ECHO' means the verified
+    revocation names the receipt being revoked (happy path); a fixed target exercises the
+    target-mismatch denial. Revocation decisions are distinct from approval decisions."""
+    def __init__(self, table):
+        self.table = table
+
+    def verify_revocation(self, reference, receipt_id, expected):
+        t = self.table.get(reference)
+        if t is None:
+            raise RegistrarDeny(403, "revocation_verifier_unavailable")
+        target = receipt_id if t.get("target") == "ECHO" else t["target"]
+        return VerifiedRevocation(
+            rev_issuer=t.get("rev_issuer", "https://issuer.example"),
+            rev_decision_id=t["rev_decision_id"], target_receipt_id=target,
+            tenant=TENANT, profile=PROFILE, board=expected.board, card_id=expected.card_id,
+            case_action=expected.case_action, card_revision=expected.card_revision,
+            verbatim_digest="d" * 64, evidence_ref="ev-r", evidence_digest="e" * 64,
+            verified_at=NOW - 10, expires_at=NOW + 3600)
+
+
 class FakeCards:
     def __init__(self, revisions):
         self.revisions = revisions  # scope tuple -> current revision
@@ -113,14 +135,17 @@ def vd(reference="ref-1", issuer="https://issuer.example", decision_id="dec-1",
         evidence_digest="e" * 64, verified_at=verified_at, expires_at=expires_at)
 
 
-def build(tmp_path, *, principals=(P1,), refs=None, cards=None, csrf=True,
+def build(tmp_path, *, principals=(P1,), refs=None, rev_refs=None, cards=None, csrf=True,
           enabled=True, clock=None, adapters=None):
     repo = ReceiptRepository(str(Path(tmp_path) / "registrar.sqlite3"))
     refs = refs if refs is not None else {"ref-1": vd()}
+    rev_refs = rev_refs if rev_refs is not None else {
+        "rev-ref-1": {"rev_decision_id": "rev-dec-1", "target": "ECHO"}}
     cards = cards if cards is not None else {scope().as_tuple(): REV}
     keys = [(p.key(), scope().as_tuple()) for p in principals]
     kw = dict(provenance=FakeProvenance(), entitlement=FakeEntitlement(keys),
-              verifier=FakeVerifier(refs), cards=FakeCards(cards), csrf=FakeCsrf(csrf),
+              verifier=FakeVerifier(refs), revocation_verifier=FakeRevocationVerifier(rev_refs),
+              cards=FakeCards(cards), csrf=FakeCsrf(csrf),
               clock=clock or FakeClock(), enabled=enabled)
     if adapters:
         kw.update(adapters)
@@ -149,7 +174,8 @@ def test_default_deny_adapters_grant_nothing():
     tmp_path = tempfile.mkdtemp()
     repo = ReceiptRepository(str(Path(tmp_path) / "r.sqlite3"))
     svc = DecisionReceiptService(repo, provenance=DenyProvenance(), entitlement=DenyEntitlement(),
-                                 verifier=DenyVerifier(), cards=DenyCardResolver(), csrf=DenyCsrf(),
+                                 verifier=DenyVerifier(), revocation_verifier=DenyRevocationVerifier(),
+                                 cards=DenyCardResolver(), csrf=DenyCsrf(),
                                  enabled=True)
     assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 403
 
@@ -257,10 +283,10 @@ def test_revoke_then_status_revoked_and_idempotent():
     tmp_path = tempfile.mkdtemp()
     svc, _ = build(tmp_path)
     rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
-    r1 = svc.revoke(State(P1), receipt_id=rid, reference="ref-1", expected=scope())
+    r1 = svc.revoke(State(P1), receipt_id=rid, reference="rev-ref-1", expected=scope())
     assert r1["revoked"] is True and r1["new_revocation"] is True and r1["status"] == "revoked"
-    r2 = svc.revoke(State(P1), receipt_id=rid, reference="ref-1", expected=scope())
-    assert r2["new_revocation"] is False and r2["status"] == "revoked"
+    r2 = svc.revoke(State(P1), receipt_id=rid, reference="rev-ref-1", expected=scope())
+    assert r2["new_revocation"] is False and r2["revoked"] is True and r2["status"] == "revoked"
 
 
 def test_revoke_wrong_scope_uniform_404():
@@ -270,15 +296,85 @@ def test_revoke_wrong_scope_uniform_404():
     keys = [(P1.key(), scope().as_tuple()), (P1.key(), scope(card="other").as_tuple())]
     svc, _ = build(tmp_path, adapters={"entitlement": FakeEntitlement(keys)})
     rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
-    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid, reference="ref-1",
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid, reference="rev-ref-1",
                                           expected=scope(card="other"))) == 404
 
 
 def test_revoke_missing_receipt_404():
     tmp_path = tempfile.mkdtemp()
     svc, _ = build(tmp_path)
-    assert deny_status(lambda: svc.revoke(State(P1), receipt_id="ghost", reference="ref-1",
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id="ghost", reference="rev-ref-1",
                                           expected=scope())) == 404
+
+
+# --------------------------------------------------------------------------- #
+# Revocation integrity (R1 P1 fixes): a revocation is a DISTINCT decision that
+# NAMES the target receipt; it can never be the approval, nor revoke a second receipt.
+# --------------------------------------------------------------------------- #
+def test_revoke_with_approval_decision_denied():
+    tmp_path = tempfile.mkdtemp()
+    # A "revocation" whose verified decision IS the approval (same issuer+decision_id).
+    rev_refs = {"rev-as-approval": {"rev_issuer": "https://issuer.example",
+                                    "rev_decision_id": "dec-1", "target": "ECHO"}}
+    svc, _ = build(tmp_path, rev_refs=rev_refs)
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid,
+                                          reference="rev-as-approval", expected=scope())) == 403
+
+
+def test_revoke_wrong_target_denied():
+    tmp_path = tempfile.mkdtemp()
+    rev_refs = {"rev-wrong-target": {"rev_decision_id": "rev-dec-x", "target": "not-this-rid"}}
+    svc, _ = build(tmp_path, rev_refs=rev_refs)
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid,
+                                          reference="rev-wrong-target", expected=scope())) == 403
+
+
+def test_revoke_same_decision_cannot_revoke_second_receipt():
+    tmp_path = tempfile.mkdtemp()
+    refs = {"ref-1": vd(decision_id="dec-1"), "ref-2": vd(decision_id="dec-2")}
+    fake_rev = FakeRevocationVerifier({"rev-fixed": {"rev_decision_id": "rev-dec-1",
+                                                     "target": "placeholder"}})
+    svc, _ = build(tmp_path, refs=refs, adapters={"revocation_verifier": fake_rev})
+    rid_a = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    rid_b = svc.register(State(P1), reference="ref-2", scope=scope())["receipt_id"]
+    # The verified revocation names receipt A only.
+    fake_rev.table["rev-fixed"]["target"] = rid_a
+    assert svc.revoke(State(P1), receipt_id=rid_a, reference="rev-fixed", expected=scope())["revoked"]
+    # Reusing it against receipt B is a target mismatch, never a silent success.
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid_b,
+                                          reference="rev-fixed", expected=scope())) == 403
+    assert svc.read(State(P1), receipt_id=rid_b, expected=scope())["status"] == "active"
+
+
+def test_repository_revoke_duplicate_other_receipt_conflict():
+    tmp_path = tempfile.mkdtemp()
+    refs = {"ref-1": vd(decision_id="dec-1"), "ref-2": vd(decision_id="dec-2")}
+    svc, repo = build(tmp_path, refs=refs)
+    rid_a = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    rid_b = svc.register(State(P1), reference="ref-2", scope=scope())["receipt_id"]
+    rev = {"rev_issuer": "i", "rev_decision_id": "rd", "tenant": TENANT, "profile": PROFILE,
+           "board": BOARD, "card_id": CARD, "case_action": ACTION, "card_revision": REV,
+           "created_at": NOW}
+    assert repo.revoke(rid_a, rev) == (True, True)
+    # Same revocation decision against a different receipt: no insert, receipt_match False.
+    assert repo.revoke(rid_b, rev) == (False, False)
+    assert repo.is_revoked(rid_a) is True and repo.is_revoked(rid_b) is False
+
+
+def test_revoke_unknown_reference_denied():
+    tmp_path = tempfile.mkdtemp()
+    svc, _ = build(tmp_path)
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid,
+                                          reference="nope", expected=scope())) == 403
+
+
+def test_register_empty_verified_fact_denied():
+    tmp_path = tempfile.mkdtemp()
+    svc, _ = build(tmp_path, refs={"ref-1": vd(decision_id="")})
+    assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 403
 
 
 # --------------------------------------------------------------------------- #
