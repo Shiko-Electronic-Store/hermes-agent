@@ -21,6 +21,7 @@ Trust rules (frozen plan r3, sha256 5fe85109…):
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -282,6 +283,9 @@ class ReceiptRepository:
                 receipt_id TEXT NOT NULL REFERENCES receipts(receipt_id),
                 rev_issuer TEXT NOT NULL,
                 rev_decision_id TEXT NOT NULL,
+                reg_issuer TEXT NOT NULL,
+                reg_provider TEXT NOT NULL,
+                reg_user_id TEXT NOT NULL,
                 tenant TEXT NOT NULL,
                 profile TEXT NOT NULL,
                 board TEXT NOT NULL,
@@ -305,6 +309,12 @@ class ReceiptRepository:
         with self._lock:
             self._conn.close()
 
+    def _safe_rollback(self):
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
     def register(self, row: dict) -> tuple:
         """Insert-or-replay inside ONE transaction. Returns (receipt_id, created, binding_match).
 
@@ -313,7 +323,10 @@ class ReceiptRepository:
         """
         binding = _canonical_binding(row)
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error:
+                _deny(503, "storage_unavailable")
             try:
                 cur = self._conn.execute(
                     "SELECT receipt_id, binding FROM receipts WHERE decision_issuer=? AND decision_id=?",
@@ -330,15 +343,21 @@ class ReceiptRepository:
                 self._conn.execute(f"INSERT INTO receipts({cols}) VALUES({ph})", vals)
                 self._conn.execute("COMMIT")
                 return receipt_id, True, True
+            except sqlite3.Error:
+                self._safe_rollback()
+                _deny(503, "storage_unavailable")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._safe_rollback()
                 raise
 
     def get(self, receipt_id: str) -> Optional[dict]:
         with self._lock:
-            cur = self._conn.execute(
-                f"SELECT {','.join(_RECEIPT_FIELDS)} FROM receipts WHERE receipt_id=?", (receipt_id,))
-            r = cur.fetchone()
+            try:
+                cur = self._conn.execute(
+                    f"SELECT {','.join(_RECEIPT_FIELDS)} FROM receipts WHERE receipt_id=?", (receipt_id,))
+                r = cur.fetchone()
+            except sqlite3.Error:
+                _deny(503, "storage_unavailable")
             if r is None:
                 return None
             return dict(zip(_RECEIPT_FIELDS, r))
@@ -351,7 +370,10 @@ class ReceiptRepository:
         receipt is a binding conflict (receipt_match=False), never a silent no-op success.
         """
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.Error:
+                _deny(503, "storage_unavailable")
             try:
                 cur = self._conn.execute(
                     "SELECT receipt_id FROM revocations WHERE rev_issuer=? AND rev_decision_id=?",
@@ -360,23 +382,40 @@ class ReceiptRepository:
                 if existing is not None:
                     self._conn.execute("COMMIT")
                     return False, existing[0] == receipt_id
+                # Defense-in-depth: a revocation key must also be disjoint from EVERY approval
+                # key in the receipts table, not just the target's, so the two decision key
+                # spaces can never overlap even if a service-layer check is bypassed.
+                clash = self._conn.execute(
+                    "SELECT 1 FROM receipts WHERE decision_issuer=? AND decision_id=? LIMIT 1",
+                    (rev["rev_issuer"], rev["rev_decision_id"])).fetchone()
+                if clash is not None:
+                    self._conn.execute("COMMIT")
+                    return False, False
                 self._conn.execute(
                     """INSERT INTO revocations(revocation_row_id,receipt_id,rev_issuer,
-                       rev_decision_id,tenant,profile,board,card_id,case_action,card_revision,created_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       rev_decision_id,reg_issuer,reg_provider,reg_user_id,
+                       tenant,profile,board,card_id,case_action,card_revision,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (uuid.uuid4().hex, receipt_id, rev["rev_issuer"], rev["rev_decision_id"],
+                     rev["reg_issuer"], rev["reg_provider"], rev["reg_user_id"],
                      rev["tenant"], rev["profile"], rev["board"], rev["card_id"],
                      rev["case_action"], rev["card_revision"], rev["created_at"]))
                 self._conn.execute("COMMIT")
                 return True, True
+            except sqlite3.Error:
+                self._safe_rollback()
+                _deny(503, "storage_unavailable")
             except Exception:
-                self._conn.execute("ROLLBACK")
+                self._safe_rollback()
                 raise
 
     def is_revoked(self, receipt_id: str) -> bool:
         with self._lock:
-            cur = self._conn.execute("SELECT 1 FROM revocations WHERE receipt_id=? LIMIT 1", (receipt_id,))
-            return cur.fetchone() is not None
+            try:
+                cur = self._conn.execute("SELECT 1 FROM revocations WHERE receipt_id=? LIMIT 1", (receipt_id,))
+                return cur.fetchone() is not None
+            except sqlite3.Error:
+                _deny(503, "storage_unavailable")
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +464,10 @@ class DecisionReceiptService:
         return principal
 
     def _check_decision_valid(self, vd: VerifiedDecision | VerifiedRevocation, now: float):
+        # Non-finite values (NaN/inf) defeat every ordering comparison below, so reject them
+        # explicitly before comparing; a NaN timestamp must never validate or commit.
+        if not (math.isfinite(vd.verified_at) and math.isfinite(vd.expires_at) and math.isfinite(now)):
+            _deny(403, "decision_invalid_time")
         if vd.verified_at > now or vd.expires_at <= now or vd.expires_at <= vd.verified_at:
             _deny(403, "decision_invalid_time")
 
@@ -439,7 +482,9 @@ class DecisionReceiptService:
         principal = self._admit(request_state, scope)
         vd = self._verifier.verify(reference, scope)
         # decision_issuer comes ONLY from verified evidence (vd), never a caller body field.
-        if not (vd.decision_issuer and vd.decision_id and vd.original_actor):
+        # Every required verified fact must be present and non-empty (fail closed).
+        if not (vd.decision_issuer and vd.decision_id and vd.original_actor
+                and vd.verbatim_digest and vd.evidence_ref and vd.evidence_digest):
             _deny(403, "incomplete_verified_decision")
         if (vd.tenant, vd.profile, vd.board, vd.card_id, vd.case_action, vd.card_revision) != scope.as_tuple():
             _deny(403, "decision_scope_mismatch")
@@ -485,7 +530,8 @@ class DecisionReceiptService:
         # the approval being revoked, and any scope-entitled principal cannot revoke an
         # arbitrary receipt with an arbitrary verified decision.
         vr = self._revocation_verifier.verify_revocation(reference, receipt_id, expected)
-        if not (vr.rev_issuer and vr.rev_decision_id):
+        if not (vr.rev_issuer and vr.rev_decision_id and vr.target_receipt_id
+                and vr.verbatim_digest and vr.evidence_ref and vr.evidence_digest):
             _deny(403, "incomplete_verified_revocation")
         if (vr.tenant, vr.profile, vr.board, vr.card_id, vr.case_action, vr.card_revision) != expected.as_tuple():
             _deny(403, "decision_scope_mismatch")
@@ -496,6 +542,8 @@ class DecisionReceiptService:
         now = self._clock.now()
         self._check_decision_valid(vr, now)
         rev = {"rev_issuer": vr.rev_issuer, "rev_decision_id": vr.rev_decision_id,
+               "reg_issuer": principal.issuer, "reg_provider": principal.provider,
+               "reg_user_id": principal.user_id,
                "tenant": expected.tenant, "profile": expected.profile, "board": expected.board,
                "card_id": expected.card_id, "case_action": expected.case_action,
                "card_revision": expected.card_revision, "created_at": now}

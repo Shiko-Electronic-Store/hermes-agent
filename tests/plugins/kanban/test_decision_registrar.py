@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import cast
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -224,6 +225,38 @@ def test_read_error_response_no_store():
     rid = client.post("/decision-registrations", json=body()).json()["receipt_id"]
     r = client.get(f"/decision-registrations/{rid}", params=qparams(card="other"))
     assert r.status_code == 404
+    assert r.headers.get("cache-control") == "no-store"
+
+
+def test_disabled_get_no_store():
+    # The disabled-dependency 404 never reaches the endpoint, yet must still be no-store.
+    client, _ = build_app(enabled=False)
+    r = client.get("/decision-registrations/x", params=qparams())
+    assert r.status_code == 404
+    assert r.headers.get("cache-control") == "no-store"
+
+
+def test_enabled_validation_422_no_store():
+    # A missing-query validation 422 is produced outside the endpoint; still no-store.
+    client, _ = build_app()
+    r = client.get("/decision-registrations/x")
+    assert r.status_code == 422
+    assert r.headers.get("cache-control") == "no-store"
+
+
+def test_uncaught_error_500_no_store():
+    class BoomService:
+        def _require_enabled(self):
+            pass
+
+        def read(self, *a, **k):
+            raise RuntimeError("boom")
+
+    app = FastAPI()
+    app.include_router(create_router(cast(DecisionReceiptService, BoomService())))
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.get("/decision-registrations/x", params=qparams())
+    assert r.status_code == 500
     assert r.headers.get("cache-control") == "no-store"
 
 

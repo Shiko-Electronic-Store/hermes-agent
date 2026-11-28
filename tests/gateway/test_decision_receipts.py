@@ -96,8 +96,10 @@ class FakeRevocationVerifier:
             rev_decision_id=t["rev_decision_id"], target_receipt_id=target,
             tenant=TENANT, profile=PROFILE, board=expected.board, card_id=expected.card_id,
             case_action=expected.case_action, card_revision=expected.card_revision,
-            verbatim_digest="d" * 64, evidence_ref="ev-r", evidence_digest="e" * 64,
-            verified_at=NOW - 10, expires_at=NOW + 3600)
+            verbatim_digest=t.get("verbatim_digest", "d" * 64),
+            evidence_ref=t.get("evidence_ref", "ev-r"),
+            evidence_digest=t.get("evidence_digest", "e" * 64),
+            verified_at=t.get("verified_at", NOW - 10), expires_at=t.get("expires_at", NOW + 3600))
 
 
 class FakeCards:
@@ -127,12 +129,13 @@ P2 = RawPrincipal("https://issuer.example", "nous", "user-2")  # collapses to sa
 
 def vd(reference="ref-1", issuer="https://issuer.example", decision_id="dec-1",
        digest="d" * 64, rev=REV, card=CARD, action=ACTION, board=BOARD,
-       verified_at=NOW - 10, expires_at=NOW + 3600):
+       verified_at=NOW - 10, expires_at=NOW + 3600,
+       evidence_ref="ev-1", evidence_digest="e" * 64):
     return VerifiedDecision(
         decision_issuer=issuer, decision_id=decision_id, original_actor="owner",
         tenant=TENANT, profile=PROFILE, board=board, card_id=card, case_action=action,
-        card_revision=rev, verbatim_digest=digest, evidence_ref="ev-1",
-        evidence_digest="e" * 64, verified_at=verified_at, expires_at=expires_at)
+        card_revision=rev, verbatim_digest=digest, evidence_ref=evidence_ref,
+        evidence_digest=evidence_digest, verified_at=verified_at, expires_at=expires_at)
 
 
 def build(tmp_path, *, principals=(P1,), refs=None, rev_refs=None, cards=None, csrf=True,
@@ -354,7 +357,9 @@ def test_repository_revoke_duplicate_other_receipt_conflict():
     svc, repo = build(tmp_path, refs=refs)
     rid_a = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
     rid_b = svc.register(State(P1), reference="ref-2", scope=scope())["receipt_id"]
-    rev = {"rev_issuer": "i", "rev_decision_id": "rd", "tenant": TENANT, "profile": PROFILE,
+    rev = {"rev_issuer": "i", "rev_decision_id": "rd", "reg_issuer": P1.issuer,
+           "reg_provider": P1.provider, "reg_user_id": P1.user_id,
+           "tenant": TENANT, "profile": PROFILE,
            "board": BOARD, "card_id": CARD, "case_action": ACTION, "card_revision": REV,
            "created_at": NOW}
     assert repo.revoke(rid_a, rev) == (True, True)
@@ -375,6 +380,71 @@ def test_register_empty_verified_fact_denied():
     tmp_path = tempfile.mkdtemp()
     svc, _ = build(tmp_path, refs={"ref-1": vd(decision_id="")})
     assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 403
+
+
+# --------------------------------------------------------------------------- #
+# R2 fixes: non-finite timestamps and empty digest/evidence facts must fail closed.
+# --------------------------------------------------------------------------- #
+def test_register_non_finite_time_denied():
+    tmp_path = tempfile.mkdtemp()
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        svc, _ = build(tempfile.mkdtemp(), refs={"ref-1": vd(verified_at=bad)})
+        assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 403
+        svc2, _ = build(tempfile.mkdtemp(), refs={"ref-1": vd(expires_at=bad)})
+        assert deny_status(lambda: svc2.register(State(P1), reference="ref-1", scope=scope())) == 403
+
+
+def test_register_empty_digest_or_evidence_denied():
+    for facts in (vd(digest=""), vd(evidence_ref=""), vd(evidence_digest="")):
+        svc, _ = build(tempfile.mkdtemp(), refs={"ref-1": facts})
+        assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 403
+
+
+def test_revoke_empty_digest_or_non_finite_denied():
+    tmp_path = tempfile.mkdtemp()
+    svc, _ = build(tmp_path, rev_refs={"rev-bad": {"rev_decision_id": "rev-dec-x",
+                                                   "target": "ECHO", "verbatim_digest": ""}})
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    assert deny_status(lambda: svc.revoke(State(P1), receipt_id=rid,
+                                          reference="rev-bad", expected=scope())) == 403
+    svc2, _ = build(tempfile.mkdtemp(), rev_refs={"rev-nan": {"rev_decision_id": "rev-dec-x",
+                                                              "target": "ECHO", "verified_at": float("nan")}})
+    rid2 = svc2.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    assert deny_status(lambda: svc2.revoke(State(P1), receipt_id=rid2,
+                                           reference="rev-nan", expected=scope())) == 403
+
+
+def test_repository_revocation_key_disjoint_from_all_approvals():
+    tmp_path = tempfile.mkdtemp()
+    svc, repo = build(tmp_path)
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    # A revocation whose key equals an EXISTING approval key (dec-1) is a conflict even
+    # though it names a valid target — the two decision key spaces must stay disjoint.
+    rev = {"rev_issuer": "https://issuer.example", "rev_decision_id": "dec-1",
+           "reg_issuer": P1.issuer, "reg_provider": P1.provider, "reg_user_id": P1.user_id,
+           "tenant": TENANT, "profile": PROFILE, "board": BOARD, "card_id": CARD,
+           "case_action": ACTION, "card_revision": REV, "created_at": NOW}
+    assert repo.revoke(rid, rev) == (False, False)
+    assert repo.is_revoked(rid) is False
+
+
+def test_revocation_provenance_persisted():
+    tmp_path = tempfile.mkdtemp()
+    svc, repo = build(tmp_path)
+    rid = svc.register(State(P1), reference="ref-1", scope=scope())["receipt_id"]
+    svc.revoke(State(P1), receipt_id=rid, reference="rev-ref-1", expected=scope())
+    row = repo._conn.execute(
+        "SELECT reg_issuer, reg_provider, reg_user_id FROM revocations WHERE receipt_id=?",
+        (rid,)).fetchone()
+    assert row == (P1.issuer, P1.provider, P1.user_id)
+
+
+def test_storage_error_maps_to_503():
+    tmp_path = tempfile.mkdtemp()
+    svc, repo = build(tmp_path)
+    repo.close()  # subsequent storage operations fail; must surface 503, never a raw 500
+    assert deny_status(lambda: svc.register(State(P1), reference="ref-1", scope=scope())) == 503
+    assert deny_status(lambda: svc.read(State(P1), receipt_id="ghost", expected=scope())) == 503
 
 
 # --------------------------------------------------------------------------- #
