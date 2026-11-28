@@ -42,6 +42,13 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Core #2 decision-receipt registrar: disabled-by-default with deny adapters and no
+# production storage. Mounting grants nothing and changes no existing behavior; enabling
+# it (trusted adapters + protected storage/reader) is a separately-approved release
+# prerequisite. See gateway/decision_receipts.py and decision_registrar.py.
+from plugins.kanban.dashboard.decision_registrar import create_router as _decision_registrar_create_router
+router.include_router(_decision_registrar_create_router())
+
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 
 
